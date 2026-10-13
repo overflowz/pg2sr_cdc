@@ -1,0 +1,406 @@
+# ═══════════════════════════════════════════════════════════════════════
+# pg2sr_cdc — Production Configuration Template
+# ═══════════════════════════════════════════════════════════════════════
+# Copy this file → name it for your env (e.g. config-staging.toml) → fill in
+# CHANGE_ME placeholders → verify with: pg2sr_cdc -c config-staging.toml
+#
+# Field conventions:
+#   CHANGE_ME         = must replace with a real value before startup
+#   /etc/pg2sr_cdc/  = suggested config-owned file paths (chown root:pg2sr_cdc,
+#                      chmod 640 for secrets, 644 for certs)
+#
+# Strict parsing: all config sections use deny_unknown_fields — typos and
+# unknown keys cause startup to fail with a parse error. This is intentional
+# (fail-fast over silent misconfiguration).
+#
+# All timeouts/intervals/delays are in MILLISECONDS. Naming convention:
+#   *_timeout_ms  — max wait for an operation to complete (HTTP, query, connect)
+#   *_interval_ms — recurring period between scheduled operations (poll, save)
+#   *_delay_ms    — one-shot base delay before retry/backoff
+#
+# Stream Load retry budget: 1 initial attempt per node + max_retries retries
+# per node, plus a bounded SHOW LOAD poll whenever a reused label is still
+# RUNNING. The per-flush deadline is derived from those numbers by
+# compute_flush_timeout() (src/pipeline.rs) — treat it as the single source of
+# truth rather than re-deriving it here:
+#   poll_budget        = 5 × (2s + mysql_query_timeout_ms + connection_timeout_ms)
+#   per_attempt_budget = max(sink_flush_timeout_ms, mysql_query_timeout_ms) + poll_budget
+#   flush_timeout      = (per_attempt_budget × (max_retries+1) + backoff) × nodes × 1.2
+# With the defaults below (3 nodes, max_retries=2, 10s timeouts) that is
+# poll_budget=110s, per_attempt=120s → ≈1307s total (≈436s for a single node).
+# The client also sends that budget to StarRocks as the `timeout` request
+# header, so SR's own per-load timeout can never outlive the client's.
+# NOTE: sink_flush_timeout_ms must cover a full ≤90MB chunk load on YOUR
+# cluster — 10s is tight on slow/loaded storage; raise it (and the flush
+# deadline follows automatically) if you see "attempt timed out" in the logs.
+
+# ── PostgreSQL Source ─────────────────────────────────────────────────
+[postgres]
+host = "prod-pg.example.com"
+port = 5432
+database = "production"
+username = "replicator"
+password = "CHANGE_ME"
+
+# PG schema to replicate. Must be a plain identifier (no glob/regex chars).
+# Default: "public"
+schema = "public"
+
+# Glob pattern to filter replicated tables by bare table name.
+# Only tables matching this glob are snapshotted and CDC-replicated.
+# Supports `*` (any sequence) and `?` (any single char).
+# Default: "*" (all tables in the schema)
+table_filter = "*"
+
+# Regex pattern to exclude tables from replication (applied after table_filter).
+# Tables matching this pattern are skipped even if they match table_filter.
+# Example: "temp_*,audit_log_*"
+# Default: "" (no exclusion)
+table_exclude = ""
+
+# Replication slot name. Created by the pipeline if it doesn't exist.
+# Default: "pg2sr_cdc_slot"
+slot_name = "pg2sr_cdc_slot"
+
+# Publication name. Created by the pipeline as FOR ALL TABLES when
+# manage_publication is true (see below).
+# Default: "pg2sr_cdc_publication"
+publication = "pg2sr_cdc_publication"
+
+# When true (default), the pipeline creates/drops/alters the publication
+# and adds tables to it automatically. Set to false when a DBA pre-creates
+# and manages the publication (common in production):
+#   - DBA controls publication membership explicitly
+#   - Pipeline will NOT execute CREATE/DROP/ALTER PUBLICATION
+#   - Tables must be added to the publication by the DBA before they appear in SR
+# Default: true
+manage_publication = false
+
+# Connection timeout in milliseconds for PostgreSQL replication connections.
+# Bounds the initial TCP connect + auth + START_REPLICATION negotiation.
+# NOT a query execution timeout — see [pipeline].query_timeout_ms.
+# Default: 30000 (30s)
+connect_timeout_ms = 10000
+
+# PostgreSQL TLS configuration
+[postgres.tls]
+# SSL mode: "disable" (default), "prefer", "require", "verify-ca", "verify-full".
+# Production: use "verify-full" (verifies server cert + hostname).
+# Default: "disable"
+mode = "verify-full"
+
+# Path to PEM file containing trusted CA certificates.
+# Required for verify-ca/verify-full when your SR/PG cert is signed by a CA
+# not in the system trust store. Uncomment and set to your CA path; if set,
+# the path is verified to exist at startup to fail fast instead of at
+# the first TLS handshake.
+# ca_cert = "/etc/pg2sr_cdc/pg-ca.pem"
+
+
+# ── StarRocks Target — connection details only ────────────────────────
+[starrocks]
+# Semicolon-separated list of FE node URLs. 3+ nodes recommended for HA quorum.
+# Format per node:
+#   host                   — default ports 8030 (HTTP) + 9030 (JDBC)
+#   host:http_port         — explicit HTTP, JDBC defaults to 9030
+#   host:http_port:jdbc_port — both explicit
+# Example: "sr-fe1:8030:9030;sr-fe2:8030:9030;sr-fe3:8030:9030"
+node_urls = "sr-fe1.example.com;sr-fe2.example.com;sr-fe3.example.com"
+
+database = "production"
+username = "root"
+password = "CHANGE_ME"
+
+# Initial TCP/TLS connection timeout in milliseconds — bounds the TCP
+# connect + TLS/auth handshake for BOTH HTTP (Stream Load) and MySQL (JDBC)
+# connections. Does NOT bound query/request execution — see
+# [pipeline].sink_flush_timeout_ms and [pipeline].mysql_query_timeout_ms.
+# Default: 10000 (10s)
+connection_timeout_ms = 10000
+
+# Maximum MySQL connections per FE node in the connection pool.
+# Bounds memory + FD usage under burst load (concurrent flushes, DDL poller,
+# and catalog queries share this pool). Must be ≥ 4.
+# Default: 32
+mysql_max_pool_connections = 32
+
+# Idle timeout in milliseconds for the HTTP connection pool (reqwest's
+# pool_idle_timeout). Idle connections are closed after this duration to
+# prevent SR from closing them first (which wastes TCP+TLS handshakes).
+# Should be ~50-60% of StarRocks' `be_http_timeout` (default 60s in SR 3.x).
+# Default: 30000 (30s)
+http_pool_idle_timeout_ms = 30000
+
+# StarRocks table properties for CREATE TABLE statements.
+# Built-in default always applies: replication_num = "1" (overridable below).
+# Common properties:
+#   replication_num            — replication factor (use "3" for HA clusters)
+#   fast_schema_evolution      — "true" for faster ADD/DROP COLUMN
+#   enable_persistent_index    — "true" for SSD-backed primary index
+#   persistent_index_type      — "CLOUD_NATIVE" for shared-data SR
+#   bloom_filter_columns       — comma-separated column names
+table_properties = { replication_num = "1", fast_schema_evolution = "true", enable_persistent_index = "true", persistent_index_type = "CLOUD_NATIVE" }
+
+# StarRocks HTTP TLS configuration (for Stream Load)
+[starrocks.http_tls]
+enable = true
+# Uncomment and set to a PEM CA path if your SR cert isn't system-trusted.
+# When set (and enable=true), the path is verified to exist at startup.
+# ca_cert = "/etc/pg2sr_cdc/sr-ca.pem"
+
+# StarRocks MySQL TLS configuration (for SQL connections)
+[starrocks.mysql_tls]
+enable = true
+# See the starrocks.http_tls.ca_cert note above.
+# ca_cert = "/etc/pg2sr_cdc/sr-ca.pem"
+
+
+# ── Pipeline — behavior timeouts and retry config ─────────────────────
+[pipeline]
+# Pipeline instance name. Used as:
+#   - application_name on all PostgreSQL connections (visible in pg_stat_activity)
+#   - lock file path: /tmp/{name}.lock (single-instance enforcement via flock)
+#   - log file path: logs/{name}.log
+# Must be a valid filename (no `/`, no null bytes, not empty, ≤ 255 bytes).
+# Default: "pg2sr_cdc"
+name = "pg2sr_cdc_prod"
+
+# Enable automatic schema evolution (DDL polling + transpilation to SR).
+# When false, only DML (INSERT/UPDATE/DELETE) is replicated — DDL changes
+# to PG tables are NOT reflected in StarRocks.
+# Default: true
+schema_sync = true
+
+# DDL poll interval in milliseconds. How often the DDL poller checks the
+# pg2sr_cdc_ddl_events capture table for new schema changes.
+# Lower = faster DDL propagation but more PG catalog queries.
+# Default: 5000
+ddl_poll_interval_ms = 5000
+
+# Max retries per SR node after the initial Stream Load attempt fails.
+# Total cluster-wide attempts = (max_retries + 1) × node_count.
+# max_retries=0 → 1 attempt per node, immediate failover, no same-node retry.
+# Stream Load labels are idempotent across node failover — if node A committed
+# but the response was lost, node B sees the duplicate label and polls SHOW LOAD
+# for the terminal state. Safe to set to 0 for HA clusters.
+# Default: 2
+max_retries = 0
+
+# Max rows to batch before flushing to StarRocks.
+# Higher = better throughput, higher latency, more memory per flush.
+# Default: 5000
+batch_rows = 5000
+
+# Max idle time in milliseconds between flushes. If no new events arrive
+# within this window, the current batch is flushed immediately.
+# Lower = lower latency, more flush round-trips.
+# Default: 500
+batch_timeout_ms = 500
+
+# DDL capture table in "schema.table" format. Created automatically by
+# the pipeline on first run.
+# Default: "public.pg2sr_cdc_ddl_events"
+ddl_capture_table = "public.pg2sr_cdc_ddl_events"
+
+# Max pending memory in MB for the pipeline buffer before forcing a flush.
+# Prevents unbounded memory growth during PG write bursts when SR is slow.
+# Default: 512
+max_pending_memory_mb = 256
+
+# Hard cap in MB on the durable wal-buffer segments
+# (<checkpoint.path>.buffer) summed across ALL tables. Those segments hold
+# rows for DDL-paused and failed tables until async replay drains them; with
+# no cap a permanently failing table (or a replay that cannot list what it
+# wrote) grows the buffer until the disk fills.
+# Exceeding the cap FAILS CLOSED: the flush returns Err, the checkpoint does
+# NOT advance, PG re-sends the WAL once you free space — no row is ever
+# dropped, but replication stalls until the buffer drains.
+# 0 disables the cap (unbounded; growth is logged as a warning only).
+# NOTE: the cap counts ACTIVE segment bytes only. Corrupt segments are moved to
+# <checkpoint.path>.buffer/quarantine/<table>/ and kept there for forensics
+# (only --fresh deletes them, and no metric reports their size), so a volume
+# can fill past this cap: reclaim manually with
+#   rm -rf <checkpoint.path>.buffer/quarantine/          (local backend)
+#   s3 rm --recursive s3://<bucket>/<path>.buffer/quarantine/   (S3 backend)
+# Default: 8192
+wal_buffer_max_mb = 8192
+
+# Snapshot page size in rows. Controls rows fetched per snapshot query,
+# independent from batch_rows (which controls CDC flush batch size).
+# Default: 50000
+snapshot_page_size = 50000
+
+# Timeout in milliseconds for PG catalog queries (DDL poll, relation
+# resolution, column metadata, snapshot data export).
+# Default: 30000
+query_timeout_ms = 30000
+
+# HTTP Stream Load per-attempt timeout in milliseconds. Bounds the
+# FE PUT + (if 307 redirected) BE PUT chain — one budget per attempt shared
+# via a deadline Instant. The reqwest client's own .timeout() acts as a
+# per-HTTP-call backstop at the same value.
+# Default: 10000
+sink_flush_timeout_ms = 10000
+
+# MySQL query execution timeout in milliseconds. Bounds ALL MySQL queries
+# sent via mysql_async: DDL (ALTER/CREATE/DROP/RENAME), catalog queries
+# (SHOW TABLES gap detection), SHOW LOAD label polling. Does NOT bound
+# pool.get_conn() acquisition — see [starrocks].connection_timeout_ms.
+# Default: 10000
+mysql_query_timeout_ms = 10000
+
+# Abort the pipeline on permanent DDL failures (3 retries exhausted).
+# When true: permanent DDL failure triggers shutdown for operator intervention.
+# When false: DDL event is FATAL-logged and checkpoint-advanced (soft-skip) —
+#   schema divergence is accepted to keep the pipeline running.
+# Production: keep true — silent schema drift is harder to diagnose than
+#   a stopped pipeline.
+# Default: true
+ddl_failure_abort = true
+
+# Sleep in milliseconds after StarRocks returns "schema change in progress"
+# error before retrying the same DDL on the next poll cycle.
+# Default: 1500
+schema_change_retry_ms = 1500
+
+# Sleep in milliseconds when a CDC Stream Load fails with "unknown column"
+# due to DDL poller lag (the column exists in PG WAL but not yet in SR).
+# After this sleep, the flush retries once. If that also fails, the
+# pipeline reconnects and replays from WAL.
+# Default: 5000
+ddl_race_retry_ms = 5000
+
+# Maximum number of concurrent per-table Stream Load requests during CDC
+# flushes. Limits simultaneous load jobs to avoid overwhelming StarRocks.
+# Default: 20
+max_concurrent_flushes = 20
+
+# Max WAL events to accumulate within a single PG transaction before
+# triggering a reconnect (avoids OOM on bulk INSERT/DELETE affecting
+# millions of rows in one transaction).
+# Default: 100000
+max_tx_events = 100000
+
+# Base delay in milliseconds between PG replication reconnection attempts.
+# Uses exponential backoff from this value up to 30s max (2× each attempt).
+# Default: 3000
+reconnect_delay_ms = 3000
+
+
+# ── Checkpoint Store ──────────────────────────────────────────────────
+# Stores pipeline progress (LSN + DDL ID) so CDC can resume after restart.
+[checkpoint]
+# Store type: "local" (filesystem) or "s3" (S3-compatible object store).
+# Production: use "s3" for durability across host failures (local file is
+# lost if the host dies, forcing a full re-snapshot from PG WAL).
+# Default: "local"
+store_type = "s3"
+
+# File path (local) or S3 object key for S3 store.
+# For S3, use a namespaced key (not a bare filename) to avoid collisions
+# if multiple pipelines share the same bucket.
+# Default: "pg2sr_cdc_checkpoint.json"
+path = "pg2sr-cdc/production-checkpoint.json"
+
+# Interval in milliseconds between automatic checkpoint saves.
+# Higher = fewer S3 PUTs (lower cost + latency) but more WAL replay on crash.
+# Lower = less WAL to replay after a crash but more I/O.
+# Default: 10000
+save_interval_ms = 10000
+
+# ── S3-specific options (used when store_type = "s3") ──
+bucket = "pg2sr-cdc-checkpoints"
+
+# S3 region.
+# Default: "us-east-1"
+region = "us-east-1"
+
+# Custom S3-compatible endpoint URL (e.g., MinIO, Ceph Object Store).
+# For AWS Standard, omit or use "https://s3.amazonaws.com".
+# Default: https://s3.amazonaws.com (AWS Standard)
+endpoint = "https://s3.us-east-1.amazonaws.com"
+
+# Use path-style addressing instead of virtual-host-style.
+# AWS Standard: false (virtual-host-style)
+# MinIO / most S3-compatible stores: true (path-style)
+# Default: true (path-style, for S3-compatible store compatibility)
+path_style = false
+
+# S3 access key ID. Falls back to env/IRSA/IMDS if not set — useful for
+# AWS IAM Roles for Service Accounts (EKS) or EC2 instance profiles.
+# Leave unset to use IRSA/IMDS env-based auth.
+access_key_id = "CHANGE_ME"
+
+# S3 secret access key. Falls back to env/IRSA/IMDS if not set.
+# Leave unset to use IRSA/IMDS env-based auth.
+secret_access_key = "CHANGE_ME"
+
+
+# ── Prometheus Metrics ───────────────────────────────────────────────
+# When enabled, the pipeline serves a lightweight HTTP listener with:
+#   GET /metrics — Prometheus text exposition format (13 metrics)
+#   GET /health  — JSON health status
+# No external crates (hyper/axum/prometheus) — raw tokio TCP listener.
+# Production: enable for scraping via Prometheus + alerting.
+# Default: disabled (no listener started)
+[metrics]
+enabled = true
+port = 9091
+# Bind address for the /metrics + /health HTTP server.
+# Default "127.0.0.1" (loopback only): LSN, throughput, reconnect counts, etc.
+# are NOT scrapable by other hosts. Set to "0.0.0.0" only when an external
+# Prometheus needs to scrape (and firewall the port).
+host = "127.0.0.1"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Deployment Variants (uncomment + edit as needed)
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── Variant 1: Single-node StarRocks (non-HA) ──
+# Replace the [starrocks] section above with:
+# [starrocks]
+# node_urls = "sr-fe1.example.com"
+# database = "production"
+# username = "root"
+# password = "CHANGE_ME"
+# connection_timeout_ms = 5000
+# # With 1 node, can afford more retries: 3 attempts × 10s + 3s backoff = 33s.
+# # Set [pipeline].max_retries = 2
+
+# ── Variant 2: TLS terminated at load balancer ──
+# If a load balancer (HAProxy, nginx, AWS NLB) terminates TLS in front of
+# StarRocks FE, leave [starrocks.http_tls] and [starrocks.mysql_tls]
+# enable = false — the LB handles TLS, the pipeline-to-LB leg is plaintext.
+
+# ── Variant 3: Local filesystem checkpoint (non-durable) ──
+# Suitable for dev/test only — loses checkpoint state if the host dies,
+# forcing a full re-snapshot on restart.
+# [checkpoint]
+# store_type = "local"
+# path = "pg2sr_cdc_checkpoint.json"
+# save_interval_ms = 10000
+
+# ── Variant 4: MinIO / S3-compatible object store ──
+# [checkpoint]
+# store_type = "s3"
+# path = "pg2sr-cdc/production-checkpoint.json"
+# save_interval_ms = 10000
+# bucket = "pg2sr-cdc-checkpoints"
+# region = "us-east-1"
+# endpoint = "http://127.0.0.1:9000"
+# path_style = true
+# access_key_id = "CHANGE_ME"
+# secret_access_key = "CHANGE_ME"
+
+# ── Variant 5: High-throughput single-table workload ──
+# When replicating one or few tables at high write rate (~10K+ events/sec),
+# per-tablet version rate can exceed SR compaction thresholds. Mitigate by
+# raising batch_rows (fewer, larger versions per second) and lowering
+# max_concurrent_flushes (fewer simultaneous versions).
+# [pipeline]
+# batch_rows = 10000
+# max_concurrent_flushes = 10
+# batch_timeout_ms = 1000
+# # max_retries = 0 (keep — budget unchanged)
+# # max_pending_memory_mb = 512 (raise to accommodate larger batches)

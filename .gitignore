@@ -1,0 +1,5 @@
+/target
+pg2sr_cdc_checkpoint.json
+*.tmp
+__pycache__/
+logs/

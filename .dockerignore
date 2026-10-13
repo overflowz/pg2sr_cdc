@@ -1,0 +1,9 @@
+.git
+.github
+.vscode
+/target
+Dockerfile*
+README.md
+PROJECT.md
+config.toml
+config-sample.toml

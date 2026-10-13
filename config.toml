@@ -1,0 +1,138 @@
+# ═══════════════════════════════════════════════════════════════════════
+# pg2sr_cdc — Local Development Configuration
+# ═══════════════════════════════════════════════════════════════════════
+# Copy this file and modify for your environment.
+# Every field below has a default — omit any you don't need to override.
+
+[postgres]
+host = "localhost"
+port = 5432
+database = "testdb"
+username = "replicator"
+password = "pass"
+
+# PG schema to replicate. Must be a plain identifier (no regex/glob).
+schema = "public"
+
+# Glob pattern to filter replicated tables by bare table name.
+table_filter = "*"
+
+# Regex to exclude tables from replication (applied after table_filter).
+table_exclude = ""
+
+# Replication slot name.
+slot_name = "pg2sr_cdc_slot"
+
+# Publication name.
+publication = "pg2sr_cdc_publication"
+
+# When true (default), the pipeline creates/drops/alters the publication.
+manage_publication = true
+
+# Connection timeout in milliseconds for PostgreSQL replication connections.
+connect_timeout_ms = 10000
+
+[postgres.tls]
+mode = "disable"
+
+
+[starrocks]
+# Single FE on default ports (8030 HTTP, 9030 JDBC).
+node_urls = "localhost:8030:9030"
+
+database = "testdb"
+username = "root"
+password = ""
+
+# Initial TCP/TLS connection timeout (ms) for both HTTP and MySQL.
+connection_timeout_ms = 10000
+
+# Maximum MySQL connections per FE node in the connection pool.
+mysql_max_pool_connections = 32
+
+# HTTP connection pool idle timeout (ms) — drop idle before SR closes them.
+http_pool_idle_timeout_ms = 30000
+
+# StarRocks table properties for CREATE TABLE statements.
+table_properties = { fast_schema_evolution = "true" }
+
+[starrocks.http_tls]
+enable = false
+
+[starrocks.mysql_tls]
+enable = false
+
+
+[pipeline]
+name = "pg2sr_cdc"
+
+schema_sync = true
+
+# DDL poll interval (ms)
+ddl_poll_interval_ms = 1000
+
+# Stream Load retries per SR node after the initial attempt fails.
+# max_retries=0 → 1 attempt per node (no retry). max_retries=2 → 3 attempts.
+max_retries = 2
+
+# Max rows to batch before flushing to StarRocks.
+batch_rows = 1000
+
+# Max idle time (ms) between flushes.
+batch_timeout_ms = 100
+
+ddl_capture_table = "public.pg2sr_cdc_ddl_events"
+
+# Max pending memory in MB for the CDC event buffer before forcing a flush.
+max_pending_memory_mb = 512
+
+snapshot_page_size = 50000
+
+# Timeout in milliseconds for PG catalog queries (DDL poll, relation resolution,
+# column metadata, snapshot data export).
+query_timeout_ms = 30000
+
+# HTTP Stream Load per-attempt timeout (ms). Bounds the FE PUT + (if 307
+# redirected) BE PUT chain via a deadline — one budget per attempt.
+sink_flush_timeout_ms = 10000
+
+# MySQL query execution timeout (ms). Bounds DDL, catalog queries
+# (SHOW TABLES), and SHOW LOAD label polling.
+mysql_query_timeout_ms = 10000
+
+ddl_failure_abort = true
+
+# Sleep after SR returns "schema change in progress" before retrying the DDL.
+schema_change_retry_ms = 300
+
+# Sleep when a CDC flush fails with "unknown column" due to DDL poller lag.
+ddl_race_retry_ms = 2000
+
+# Maximum number of concurrent per-table Stream Load requests during flushes.
+max_concurrent_flushes = 2
+
+# Max WAL events to accumulate within a single PG transaction before
+# triggering a reconnect.
+max_tx_events = 100000
+
+# Base delay (ms) between PG replication reconnection attempts.
+# Uses exponential backoff from this value up to 30s max.
+reconnect_delay_ms = 3000
+
+
+[checkpoint]
+store_type = "s3"
+path = "pg2sr-cdc-checkpoint.json"
+save_interval_ms = 10000
+
+bucket = "pg2sr-cdc-checkpoints"
+region = "us-east-1"
+endpoint = "http://127.0.0.1:9000"
+path_style = true
+access_key_id = "AAAAAAAAAAAAAAAAAAAA"
+secret_access_key = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+
+
+[metrics]
+enabled = true
+port = 9091

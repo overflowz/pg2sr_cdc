@@ -1,0 +1,277 @@
+# ═══════════════════════════════════════════════════════════════════════
+# pg2sr_cdc — Local Testing Environment
+# PostgreSQL 18 + StarRocks 4.1.2 (shared-data, 3 FE + 2 CN HA)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# 3 FEs provide true BDB-JE quorum: death of any single FE still leaves
+# (3/2)+1 = 2 voters for leader election. The pipeline's circuit breaker
+# transparently routes to the surviving leader.
+#
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f sr-init
+#
+# Host ports (pipeline connects via localhost):
+#   PG:       5432
+#   MinIO:    9000 (S3), 9001 (console)
+#   FE1:      8030 (HTTP), 9030 (MySQL)
+#   FE2:      8031 (HTTP), 9031 (MySQL)
+#   FE3:      8032 (HTTP), 9032 (MySQL)
+#   CN1:      8040 (HTTP — Stream Load redirect target)
+#   CN2:      8041 (HTTP — Stream Load redirect target)
+#
+# Pipeline config: node_urls = "localhost:8030:9030;localhost:8031:9031"
+# No /etc/hosts changes needed.
+
+services:
+  postgres:
+    image: postgres:18
+    ports: ["5432:5432"]
+    environment:
+      POSTGRES_DB: testdb
+      POSTGRES_USER: replicator
+      POSTGRES_PASSWORD: pass
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=10", "-c", "max_wal_senders=10", "-c", "max_connections=100"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U replicator -d testdb"]
+      interval: 5s
+      retries: 10
+    volumes: [pg_data:/var/lib/postgresql]
+    networks: [sr_net]
+
+  minio:
+    image: minio/minio:latest
+    ports: ["9000:9000", "9001:9001"]
+    environment:
+      MINIO_ROOT_USER: miniouser
+      MINIO_ROOT_PASSWORD: miniopassword
+    entrypoint: sh
+    command: ['-c', 'mkdir -p /minio_data/starrocks && minio server /minio_data --console-address ":9001"']
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes: [minio_data:/minio_data]
+    networks: [sr_net]
+
+  minio_mc:
+    image: minio/mc:latest
+    entrypoint: [sh, -c]
+    command:
+      - |
+        until mc ls minio > /dev/null 2>&1; do sleep 0.5; done
+        mc alias set myminio http://minio:9000 miniouser miniopassword
+        mc mb --ignore-existing myminio/starrocks
+        mc mb --ignore-existing myminio/pg2sr-cdc-checkpoints
+        mc admin user svcacct add --access-key AAAAAAAAAAAAAAAAAAAA --secret-key BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB myminio miniouser
+    depends_on:
+      minio: { condition: service_healthy }
+    networks: [sr_net]
+
+  sr-fe1:
+    image: starrocks/fe-ubuntu:4.1.2
+    user: root
+    ports: ["8030:8030", "9030:9030"]
+    command:
+      - bash
+      - -c
+      - |
+        cat >> /opt/starrocks/fe/conf/fe.conf <<'EOF'
+        run_mode = shared_data
+        priority_networks = 172.0.0.0/8
+        EOF
+        /opt/starrocks/fe/bin/start_fe.sh
+        while [ ! -f /opt/starrocks/fe/log/fe.log ]; do sleep 1; done
+        exec tail -F /opt/starrocks/fe/log/fe.log
+    healthcheck:
+      test: 'mysql -u root -h 127.0.0.1 -P 9030 -e "show frontends\G" |grep "Alive: true"'
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    depends_on:
+      minio: { condition: service_healthy }
+    volumes: [fe1_meta:/opt/starrocks/fe/meta, fe1_log:/opt/starrocks/fe/log]
+    networks: [sr_net]
+
+  sr-init:
+    image: starrocks/fe-ubuntu:4.1.2
+    user: root
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        echo "Waiting for FE1..."
+        until mysql --connect-timeout 2 -h sr-fe1 -P9030 -uroot -e "SHOW FRONTENDS\G" 2>/dev/null | grep -q "Alive: true"; do sleep 3; done
+        echo "FE1 ready. Waiting for FE2/FE3/CN1/CN2 IPs..."
+        for svc in sr-fe2 sr-fe3 sr-cn1 sr-cn2; do
+          until getent hosts $$svc > /dev/null 2>&1; do sleep 2; done
+        done
+        FE2_IP=$$(getent hosts sr-fe2 | awk '{print $$1}')
+        FE3_IP=$$(getent hosts sr-fe3 | awk '{print $$1}')
+        CN1_IP=$$(getent hosts sr-cn1 | awk '{print $$1}')
+        CN2_IP=$$(getent hosts sr-cn2 | awk '{print $$1}')
+        echo "FE2=$$FE2_IP FE3=$$FE3_IP CN1=$$CN1_IP CN2=$$CN2_IP"
+        echo "Registering FE2 follower..."
+        mysql -h sr-fe1 -P9030 -uroot -e "ALTER SYSTEM ADD FOLLOWER \"$$FE2_IP:9010\";" 2>/dev/null || true
+        echo "Registering FE3 follower..."
+        mysql -h sr-fe1 -P9030 -uroot -e "ALTER SYSTEM ADD FOLLOWER \"$$FE3_IP:9010\";" 2>/dev/null || true
+        echo "Registering CN1..."
+        mysql -h sr-fe1 -P9030 -uroot -e "ALTER SYSTEM ADD COMPUTE NODE \"$$CN1_IP:9050\";" 2>/dev/null || true
+        echo "Registering CN2..."
+        mysql -h sr-fe1 -P9030 -uroot -e "ALTER SYSTEM ADD COMPUTE NODE \"$$CN2_IP:9050\";" 2>/dev/null || true
+        echo "Creating storage volume..."
+        MINIO_IP=$$(getent hosts minio | awk '{print $$1}')
+        echo "MinIO IP: $$MINIO_IP"
+        mysql -h sr-fe1 -P9030 -uroot -e "CREATE STORAGE VOLUME s3_volume TYPE=S3 LOCATIONS=(\"s3://starrocks/\") PROPERTIES(\"enabled\"=\"true\",\"aws.s3.endpoint\"=\"http://$$MINIO_IP:9000\",\"aws.s3.access_key\"=\"AAAAAAAAAAAAAAAAAAAA\",\"aws.s3.secret_key\"=\"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\",\"aws.s3.use_instance_profile\"=\"false\",\"aws.s3.use_aws_sdk_default_behavior\"=\"false\");" 2>/dev/null || true
+        echo "Setting default storage volume..."
+        mysql -h sr-fe1 -P9030 -uroot -e "SET s3_volume AS DEFAULT STORAGE VOLUME;"
+        echo "Done."
+    depends_on:
+      sr-fe1: { condition: service_healthy }
+      sr-fe2: { condition: service_started }
+      sr-fe3: { condition: service_started }
+      sr-cn1: { condition: service_started }
+      sr-cn2: { condition: service_started }
+      minio_mc: { condition: service_completed_successfully }
+    networks: [sr_net]
+
+  sr-fe2:
+    image: starrocks/fe-ubuntu:4.1.2
+    user: root
+    ports: ["8031:8030", "9031:9030"]
+    command:
+      - bash
+      - -c
+      - |
+        cat >> /opt/starrocks/fe/conf/fe.conf <<'EOF'
+        run_mode = shared_data
+        priority_networks = 172.0.0.0/8
+        EOF
+        until mysql --connect-timeout 2 -h sr-fe1 -P9030 -uroot -e "SELECT 1" 2>/dev/null > /dev/null; do sleep 3; done
+        FE1_IP=$$(getent hosts sr-fe1 | awk '{print $$1}')
+        echo "Joining cluster via $$FE1_IP:9010"
+        for i in $$(seq 1 60); do
+          /opt/starrocks/fe/bin/start_fe.sh --helper $$FE1_IP:9010 2>/dev/null && break
+          echo "Retry $$i/60: waiting for sr-init to register this follower..."
+          sleep 5
+        done
+        while [ ! -f /opt/starrocks/fe/log/fe.log ]; do sleep 1; done
+        exec tail -F /opt/starrocks/fe/log/fe.log
+    healthcheck:
+      test: 'mysql -u root -h 127.0.0.1 -P 9030 -e "show frontends\G" 2>/dev/null |grep "Alive: true"'
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+    depends_on:
+      sr-fe1: { condition: service_healthy }
+      minio_mc: { condition: service_completed_successfully }
+    volumes: [fe2_meta:/opt/starrocks/fe/meta, fe2_log:/opt/starrocks/fe/log]
+    networks: [sr_net]
+
+  sr-fe3:
+    image: starrocks/fe-ubuntu:4.1.2
+    user: root
+    ports: ["8032:8030", "9032:9030"]
+    command:
+      - bash
+      - -c
+      - |
+        cat >> /opt/starrocks/fe/conf/fe.conf <<'EOF'
+        run_mode = shared_data
+        priority_networks = 172.0.0.0/8
+        EOF
+        until mysql --connect-timeout 2 -h sr-fe1 -P9030 -uroot -e "SELECT 1" 2>/dev/null > /dev/null; do sleep 3; done
+        FE1_IP=$$(getent hosts sr-fe1 | awk '{print $$1}')
+        echo "Joining cluster via $$FE1_IP:9010"
+        for i in $$(seq 1 60); do
+          /opt/starrocks/fe/bin/start_fe.sh --helper $$FE1_IP:9010 2>/dev/null && break
+          echo "Retry $$i/60: waiting for sr-init to register this follower..."
+          sleep 5
+        done
+        while [ ! -f /opt/starrocks/fe/log/fe.log ]; do sleep 1; done
+        exec tail -F /opt/starrocks/fe/log/fe.log
+    healthcheck:
+      test: 'mysql -u root -h 127.0.0.1 -P 9030 -e "show frontends\G" 2>/dev/null |grep "Alive: true"'
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+    depends_on:
+      sr-fe1: { condition: service_healthy }
+      minio_mc: { condition: service_completed_successfully }
+    volumes: [fe3_meta:/opt/starrocks/fe/meta, fe3_log:/opt/starrocks/fe/log]
+    networks: [sr_net]
+
+  sr-cn1:
+    image: starrocks/cn-ubuntu:4.1.2
+    user: root
+    ports: ["8040:8040"]
+    command:
+      - bash
+      - -c
+      - |
+        cat >> /opt/starrocks/cn/conf/cn.conf <<'EOF'
+        priority_networks = 172.0.0.0/8
+        EOF
+        /opt/starrocks/cn/bin/start_cn.sh
+        while [ ! -f /opt/starrocks/be/log/cn.INFO ]; do sleep 1; done
+        exec tail -F /opt/starrocks/be/log/cn.INFO
+    healthcheck:
+      test: 'mysql -u root -h sr-fe1 -P 9030 -e "show compute nodes\G" 2>/dev/null |grep "Alive: true"'
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+    depends_on:
+      sr-fe1: { condition: service_healthy }
+      minio_mc: { condition: service_completed_successfully }
+    volumes: [cn1_storage:/opt/starrocks/be/storage, cn1_log:/opt/starrocks/be/log]
+    networks: [sr_net]
+
+  sr-cn2:
+    image: starrocks/cn-ubuntu:4.1.2
+    user: root
+    ports: ["8041:8040"]
+    command:
+      - bash
+      - -c
+      - |
+        cat >> /opt/starrocks/cn/conf/cn.conf <<'EOF'
+        priority_networks = 172.0.0.0/8
+        EOF
+        /opt/starrocks/cn/bin/start_cn.sh
+        while [ ! -f /opt/starrocks/be/log/cn.INFO ]; do sleep 1; done
+        exec tail -F /opt/starrocks/be/log/cn.INFO
+    healthcheck:
+      test: 'mysql -u root -h sr-fe1 -P 9030 -e "show compute nodes\G" 2>/dev/null |grep -c "Alive: true" | grep -q "2"'
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+    depends_on:
+      sr-fe1: { condition: service_healthy }
+      minio_mc: { condition: service_completed_successfully }
+    volumes: [cn2_storage:/opt/starrocks/be/storage, cn2_log:/opt/starrocks/be/log]
+    networks: [sr_net]
+
+networks:
+  sr_net:
+    driver: bridge
+
+volumes:
+  pg_data:
+  minio_data:
+  fe1_meta:
+  fe1_log:
+  fe2_meta:
+  fe2_log:
+  fe3_meta:
+  fe3_log:
+  cn1_storage:
+  cn1_log:
+  cn2_storage:
+  cn2_log:

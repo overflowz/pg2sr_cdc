@@ -1,0 +1,88 @@
+[package]
+name = "pg2sr_cdc"
+version = "0.1.0"
+edition = "2021"
+description = "PostgreSQL to StarRocks CDC pipeline"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+# PG replication
+pgwire-replication = "0.3"
+pgoutput = "=0.0.7"
+
+# SQL transpilation — only PG ↔ StarRocks, not all 33 dialects.
+# Must include "stacker" to prevent parser stack overflow on nested DDL.
+polyglot-sql = { version = "0.5", default-features = false, features = [
+    "generate", "transpile",
+    "dialect-postgresql", "dialect-starrocks",
+    "stacker",
+] }
+
+# Zero-copy byte buffers (used by reqwest internally; adding explicitly for O(1) Stream Load payload clone)
+bytes = "1"
+
+# Config
+toml = "0.8"
+
+# Regex for table filter
+regex = "1"
+
+# Jitter for exponential backoff (thundering-herd prevention)
+fastrand = "2"
+
+# Observability: metrics crate for SLO histograms (flush latency p50/p95/p99)
+# and a Prometheus recorder that renders into the existing /metrics endpoint.
+metrics = "0.23"
+metrics-exporter-prometheus = "0.15"
+
+# SHA-256 for stable schema hashing (avoids djb2 collisions)
+sha2 = "0.10"
+
+# File locking (flock)
+fs2 = "0.4"
+
+# PG direct connections (DDL setup, snapshot)
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+tokio-postgres-rustls = "0.13"
+
+# TLS: rustls for PG direct + SR HTTP, system certs
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+rustls-native-certs = "0.8"
+
+# StarRocks MySQL protocol
+mysql_async = "0.34"
+
+# Async concurrency utilities (join_all for parallel pool shutdown)
+futures = "0.3"
+
+# S3 checkpoint support (S3-compatible stores: MinIO, Ceph, etc.)
+rusty-s3 = "0.5"
+url = "2"
+# URL path-segment percent encoding (space -> %20) for Stream Load URLs.
+percent-encoding = "2"
+async-trait = "0.1"
+time = { version = "0.3", features = ["parsing", "formatting"] }
+
+[dev-dependencies]
+# HTTP mock server for testing SR Stream Load and S3 checkpoint behavior
+wiremock = "0.6"
+# Temp file/dir for checkpoint LocalStore tests
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true            # link-time optimization (size reduction)
+codegen-units = 1     # single codegen unit for better inlining + dead code
+strip = true          # strip debug symbols
